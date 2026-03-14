@@ -1,33 +1,31 @@
 [package]
-name = "motor_fix_rust"
+name = "state_engine_carry_trade"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 # --- INFRAESTRUCTURA ---
 log = "0.4"
-env_logger = "0.11" # Actualizado para mejor compatibilidad con tokio 1.0
+flexi_logger = { version = "0.27", features = ["async"] }
 dotenv = "0.15.0"
 tokio = { version = "1.0", features = ["full"] }
-chrono = "0.4"
-# Nota: Si usas fefix para parsing manual, mantén 0.7. Si usas tu propio motor, podrías omitirlo.
+chrono = { version = "0.4", features = ["serde"] } # Añadimos soporte para serializar fechas
 fefix = { version = "0.7", features = ["full"] }
 
-# --- FASE 3/4: MACHINE LEARNING & MATH ---
-# Algebra lineal con soporte para funciones matemáticas
-ndarray = { version = "0.16.0", features = ["serde"] }
+# --- MONITOREO DE SISTEMA (Nuevo) ---
+# Vital para comparar tu PC local contra el VPS de Beeks
+sysinfo = "0.30" 
 
-# Vital: ndarray-rand 0.15 requiere rand 0.8
+# --- FASE 3/4: MACHINE LEARNING & MATH ---
+ndarray = { version = "0.16.0", features = ["serde"] }
 ndarray-rand = "0.15.0" 
 rand = "0.8.5"
 rand_distr = "0.4.3"
-
-# Necesario para funciones como .ln() y .sqrt() en contextos genéricos
 num-traits = "0.2"
-
-# Gestión de series temporales para Features
 ringbuffer = "0.15.0"
 
-# --- SERIALIZACIÓN (Opcional pero recomendada para guardar el cerebro) ---
+# --- SERIALIZACIÓN & PERSISTENCIA ---
+# Añadimos bincode para que el cerebro no olvide lo aprendido al cerrar el programa
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+bincode = "1.3"
