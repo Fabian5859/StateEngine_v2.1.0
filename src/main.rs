@@ -1,3 +1,4 @@
+use chrono::Local;
 use dotenv::dotenv;
 use log::{info, warn};
 use std::collections::VecDeque;
@@ -27,7 +28,7 @@ use executor::Executor;
 use features::FeatureCollector;
 use id_gen::IdGenerator;
 use risk::RiskManager;
-use state::{OrderBook, Position, TradeStatus};
+use state::{OrderBook, Position};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .duplicate_to_stderr(Duplicate::All)
         .start()?;
 
-    info!("=== STATE ENGINE: INSTITUTIONAL SNIPER (V4.0 FINAL) ===");
+    info!("=== STATE ENGINE: SNIPER LOB-ONLY (V5.2 FIXED) ===");
 
     // --- 2. CONFIGURACIÓN DE SISTEMA ---
     let mut _sys = System::new_all();
@@ -65,13 +66,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut order_book = OrderBook::new();
     let mut collector = FeatureCollector::new(100);
     let id_factory = IdGenerator::new();
-    let mut risk_manager = RiskManager::new(1);
+    let risk_manager = RiskManager::new(); // Removido mut innecesario
     let mut executor = Executor::new();
     let mut quote_seq: u64 = 1;
     let mut trade_seq: u64 = 1;
-    let mut msg_count: u64 = 0;
 
-    // Fase 4: Inicialización con 10 dimensiones y Learning Rate 0.005
     let mut brain = BayesianBrain::load_from_file(weights_path)
         .unwrap_or_else(|_| BayesianBrain::new(10, 16, 0.005));
 
@@ -89,9 +88,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let port_trade = env::var("FIX_PORT_TRADE")?;
     let symbol = env::var("FIX_SYMBOL").unwrap_or_else(|_| "EURUSD".to_string());
 
-    // --- 4. BUCLE MAESTRO DE RECONEXIÓN ---
     'reconnect: loop {
-        info!("🔌 Conectando para Fase 4: Calibración...");
+        info!("🔌 Conectando para operación LOB Sniper...");
 
         let mut quote_stream = match network::connect_to_broker(&host, &port_quote).await {
             Ok(s) => s,
@@ -111,7 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        // Logon Handshake
+        // Logon
         let mut buf_q = Vec::new();
         engine.build_logon(
             &mut buf_q, &sender_id, &target_id, "QUOTE", &password, quote_seq,
@@ -124,7 +122,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         trade_stream.write_all(&buf_t).await?;
 
-        // MD Request (Ahora configurado en fix_engine para pedir trades 269=2)
         quote_seq += 1;
         let mut md_req = Vec::new();
         engine.build_market_data_request(&mut md_req, &sender_id, &target_id, quote_seq, &symbol);
@@ -139,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    info!("🛑 Guardando BayesianBrain (10D)...");
+                    info!("🛑 Guardando BayesianBrain...");
                     let _ = brain.save_to_file(weights_path);
                     return Ok(());
                 }
@@ -163,17 +160,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Ok(0) => break,
                         Ok(n) => {
                             let msg = String::from_utf8_lossy(&trade_buf[..n]).replace('\x01', "|");
-
-                            // Diagnóstico de Trade
-                            if msg.contains("|269=2") || msg.contains("|32=") {
-                                info!("🔍 [DIAGNOSTICO TRADE RAW]: {}", msg);
-                            }
-
-                            if let Some(last_qty) = extract_tag_val(&msg, "32") {
-                                collector.add_tape_trade(last_qty);
-                                info!("🎯 [TAPE] Agresión detectada vía TRADE (Tag 32): {}", last_qty);
-                            }
-
                             if msg.contains("|35=1|") {
                                 trade_seq += 1;
                                 let mut hb = Vec::new();
@@ -181,7 +167,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 engine.build_heartbeat(&mut hb, &sender_id, &target_id, trade_seq, test_id.as_deref());
                                 let _ = trade_stream.write_all(&hb).await;
                             }
-                            executor.handle_execution_report(&msg, &mut risk_manager, &mut pending_thesis);
+                            executor.handle_execution_report(&msg, &mut pending_thesis);
                         }
                         Err(_) => break,
                     }
@@ -194,20 +180,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let raw = String::from_utf8_lossy(&quote_buf[..n]);
                             for content in raw.split("8=FIX.4.4").filter(|s| !s.is_empty()) {
                                 let msg = content.replace('\x01', "|");
-
-                                // --- CAPTURA DE TAPE REAL-TIME (IC MARKETS) ---
-                                if msg.contains("|269=2") {
-                                    if let Some(trade_vol) = extract_tag_val(&msg, "271") {
-                                        collector.add_tape_trade(trade_vol);
-                                        info!("🔥 [TAPE] Ejecución pública detectada (Tag 271): {:.0}", trade_vol);
-                                    }
-                                }
-
                                 process_lob_message(&msg, &mut order_book, &mut tick_count);
 
                                 if let Some(mid) = order_book.get_mid_price() {
-                                    msg_count += 1;
-
                                     let elapsed = last_velocity_calc.elapsed().as_secs_f64();
                                     if elapsed >= 1.0 {
                                         current_velocity = tick_count / elapsed;
@@ -215,67 +190,79 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         last_velocity_calc = Instant::now();
                                     }
 
-                                    collector.push_features(&order_book, current_velocity, 0.00001, collector.snr_ema);
-                                    let norm_v = collector.get_standardized_vector();
+                                    let raw_v = collector.push_features(&order_book, current_velocity, 0.00001, collector.snr_ema);
+                                    let norm_v = collector.get_standardized_vector(raw_v);
 
                                     if !norm_v.is_empty() {
                                         let b_out = brain.predict_bayesian(&norm_v, 20);
                                         collector.push_snr(b_out.snr);
-
                                         let snr_avg = collector.snr_ema;
-                                        let strength = collector.get_relative_snr_strength(b_out.snr);
 
-                                        if msg_count % 50 == 0 {
-                                            info!("📊 [V4-SNR] Strength: {:.2}x | Mu: {:.3} | Tape_Acc: {:.0}", strength, b_out.mu, collector.tape_volume_acc);
-                                        }
+                                        // --- GESTIÓN DE POSICIONES (SALIDAS Y OLVIDO) ---
+                                        let mut to_close = Vec::new();
+                                        for (id, pos) in executor.positions.iter_mut() {
+                                            let pips = if pos.side == '1' { (mid - pos.entry_price) * 10000.0 } else { (pos.entry_price - mid) * 10000.0 };
 
-                                        if risk_manager.get_status() == TradeStatus::Filled {
-                                            if executor.monitor_position(mid, b_out.snr, snr_avg, b_out.mu, &order_book, &mut risk_manager, collector.tape_volume_acc) {
-                                                if let Some(pos) = executor.active_position.take() {
-                                                    trade_seq += 1;
-                                                    let mut exit_buf = Vec::new();
-                                                    let side_to_close = if pos.side == '1' { '2' } else { '1' };
-                                                    info!("🎯 [SNIPER EXIT] Ejecutando cierre ID: {}", pos.broker_pos_id);
-                                                    engine.build_close_order(&mut exit_buf, &sender_id, &target_id, trade_seq, &id_factory.next_id(), &symbol, side_to_close, pos.qty, &pos.broker_pos_id);
-                                                    let _ = trade_stream.write_all(&exit_buf).await;
-                                                    risk_manager.set_status(TradeStatus::Idle);
+                                            // PASO C: Aprendizaje por olvido
+                                            if !pos.is_forgotten && pips <= -15.0 {
+                                                warn!("🧠 [OLVIDO] ID: {} DD > 15 pips. Olvidando.", id);
+                                                pos.is_forgotten = true;
+                                                brain.train(&pos.entry_features, 0.0);
+                                            }
+
+                                            // Llamadas estáticas al Executor para evitar E0502
+                                            if pos.is_forgotten {
+                                                if Executor::check_forgotten_recovery(pos, mid, 2.0, -0.5) {
+                                                    to_close.push(id.clone());
+                                                }
+                                            } else {
+                                                if Executor::monitor_position(pos, mid, b_out.snr, snr_avg) {
+                                                    to_close.push(id.clone());
+                                                    if pips > 0.0 { brain.train(&pos.entry_features, 1.0); }
                                                 }
                                             }
                                         }
 
-                                        if msg_count % 10 == 0 && risk_manager.get_status() == TradeStatus::Idle {
-                                            let side = if b_out.mu > 0.85 { '1' } else if b_out.mu < 0.15 { '2' } else { ' ' };
+                                        for id in to_close {
+                                            if let Some(pos) = executor.positions.remove(&id) {
+                                                trade_seq += 1;
+                                                let mut exit_buf = Vec::new();
+                                                let side_to_close = if pos.side == '1' { '2' } else { '1' };
+                                                engine.build_close_order(&mut exit_buf, &sender_id, &target_id, trade_seq, &id_factory.next_id(), &symbol, side_to_close, pos.qty, &pos.broker_pos_id);
+                                                let _ = trade_stream.write_all(&exit_buf).await;
+                                            }
+                                        }
 
-                                            if side != ' ' && strength > 1.5 {
-                                                let wall_side = if side == '1' { '1' } else { '0' };
-                                                let initial_wall = order_book.get_volume_at_depth(wall_side, 0, 1);
-
-                                                if let Some(_is_market) = executor.evaluate_sniper_entry(side, &order_book, initial_wall, b_out.snr, snr_avg, collector.tape_volume_acc) {
+                                        // --- LÓGICA DE ENTRADA (ABSORCIÓN) ---
+                                        for side in ['1', '2'] {
+                                            if risk_manager.validate_signal(side, b_out.snr, &executor.positions) {
+                                                let avg_vol = 60.0;
+                                                if let Some(limit_price) = executor.evaluate_absorption_test(side, &order_book, avg_vol, mid) {
                                                     let cl_ord_id = id_factory.next_id();
-                                                    let hard_stop = risk_manager.calculate_hard_stop(side, mid);
+                                                    let hard_stop = risk_manager.calculate_hard_stop(side, limit_price);
 
-                                                    pending_thesis = Some(Position {
+                                                    let new_pos = Position {
                                                         cl_ord_id: cl_ord_id.clone(),
                                                         broker_pos_id: String::new(),
-                                                        entry_price: mid,
+                                                        entry_price: limit_price,
                                                         side,
                                                         qty: trade_qty,
-                                                        opened_at: chrono::Local::now(),
+                                                        opened_at: Local::now(),
+                                                        is_forgotten: false,
                                                         entry_mu: b_out.mu,
                                                         probability: b_out.snr,
                                                         hard_stop_price: hard_stop,
-                                                        entry_wall_volume: initial_wall,
-                                                        entry_tape_aggression: collector.tape_volume_acc,
                                                         max_adverse_pips: 0.0,
-                                                        min_probability_seen: b_out.snr,
-                                                    });
+                                                        entry_features: norm_v.clone(),
+                                                    };
 
                                                     trade_seq += 1;
                                                     let mut buf = Vec::new();
                                                     engine.build_order_request(&mut buf, &sender_id, &target_id, trade_seq, &cl_ord_id, &symbol, side, trade_qty, hard_stop);
                                                     let _ = trade_stream.write_all(&buf).await;
-                                                    risk_manager.set_status(TradeStatus::PendingNew);
-                                                    info!("🏹 [SNIPER FIRE] Mu: {:.2} | Conv: {:.1}x | Stop: {:.5}", b_out.mu, strength, hard_stop);
+
+                                                    pending_thesis = Some(new_pos);
+                                                    info!("🏹 [ABSORCIÓN] Limit en {} | Prob: {:.2}", limit_price, b_out.snr);
                                                 }
                                             }
                                         }

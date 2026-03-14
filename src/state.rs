@@ -1,7 +1,6 @@
 use chrono::{DateTime, Local};
 use std::collections::BTreeMap;
 
-/// Representa el ciclo de vida completo de una orden.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TradeStatus {
     Idle,
@@ -12,7 +11,6 @@ pub enum TradeStatus {
     Rejected,
 }
 
-/// --- Gestión de Posición Activa (V4.0 - Fase 3 & 4) ---
 #[derive(Debug, Clone)]
 pub struct Position {
     pub cl_ord_id: String,
@@ -21,23 +19,16 @@ pub struct Position {
     pub side: char, // '1' Buy, '2' Sell
     pub qty: f64,
     pub opened_at: DateTime<Local>,
-
-    // --- Métricas Bayesianas y de Calidad ---
+    pub is_forgotten: bool,
     pub entry_mu: f64,
     pub probability: f64,
-
-    // --- Seguridad de Vuelo (FASE 3) ---
-    pub hard_stop_price: f64, // El paracaídas físico calculado al entrar
-
-    // --- Métricas de Volumen Institucional (FASE 1 & 4) ---
-    pub entry_wall_volume: f64,     // Volumen del muro LOB al entrar
-    pub entry_tape_aggression: f64, // Volumen real ejecutado (Tape) al entrar
+    pub hard_stop_price: f64,
     pub max_adverse_pips: f64,
-    pub min_probability_seen: f64,
+    pub entry_features: Vec<f64>, // Guardamos las condiciones de mercado al entrar para el aprendizaje (Paso C)
 }
 
 pub struct OrderBook {
-    pub bids: BTreeMap<i64, f64>, // Precio escalado (i64) -> Volumen
+    pub bids: BTreeMap<i64, f64>,
     pub asks: BTreeMap<i64, f64>,
 }
 
@@ -66,58 +57,38 @@ impl OrderBook {
         }
     }
 
-    // --- FUNCIONES DE ACCESO BÁSICO ---
-
     pub fn get_mid_price(&self) -> Option<f64> {
         let best_bid = self.bids.keys().rev().next()?;
         let best_ask = self.asks.keys().next()?;
         Some((*best_bid as f64 + *best_ask as f64) / 200000.0)
     }
 
-    pub fn get_best_bid(&self) -> Option<f64> {
-        self.bids.keys().rev().next().map(|&p| p as f64 / 100000.0)
-    }
-
-    pub fn get_best_ask(&self) -> Option<f64> {
-        self.asks.keys().next().map(|&p| p as f64 / 100000.0)
-    }
-
-    // --- FASE 1 & 2: ANÁLISIS DE MICROESTRUCTURA ---
-
-    /// Obtiene el volumen acumulado en un rango específico de niveles.
-    pub fn get_volume_at_depth(&self, side: char, start: usize, end: usize) -> f64 {
-        if side == '0' {
-            self.bids.values().rev().skip(start).take(end - start).sum()
-        } else {
-            self.asks.values().skip(start).take(end - start).sum()
-        }
-    }
-
-    /// Calcula la salud de un muro específico (Erosión).
-    pub fn get_wall_health(&self, side: char, initial_vol: f64) -> f64 {
-        if initial_vol <= 0.0 {
-            return 0.0;
-        }
-        let current_vol = if side == '0' {
-            *self.bids.values().rev().next().unwrap_or(&0.0)
-        } else {
-            *self.asks.values().next().unwrap_or(&0.0)
+    /// Detecta si hay un hueco de liquidez (poca densidad) en los próximos X pips.
+    /// Clave para la estrategia de Absorción (Paso B).
+    pub fn is_liquidity_gap(&self, side: char, pips: i64) -> bool {
+        let mid_price = match self.get_mid_price() {
+            Some(p) => p,
+            None => return false,
         };
-        current_vol / initial_vol
-    }
+        let mid_key = (mid_price * 100000.0).round() as i64;
+        let mut density = 0.0;
 
-    /// Detecta un "Vacío de Liquidez" (Liquidity Gap) (Fase 2).
-    pub fn is_liquidity_gap_present(&self, side: char, threshold_ratio: f64) -> bool {
-        let shock_vol = self.get_volume_at_depth(side, 0, 5);
-        let deeper_vol = self.get_volume_at_depth(side, 5, 20);
-
-        if shock_vol <= 0.0 {
-            return true;
+        if side == '1' {
+            // Mirando hacia arriba para un Sell
+            for i in 1..=pips {
+                density += self.asks.get(&(mid_key + i)).unwrap_or(&0.0);
+            }
+        } else {
+            // Mirando hacia abajo para un Buy
+            for i in 1..=pips {
+                density += self.bids.get(&(mid_key - i)).unwrap_or(&0.0);
+            }
         }
-        (deeper_vol / shock_vol) < threshold_ratio
+        // Un gap se define si el volumen total en el rango es menor a un umbral mínimo
+        density < 5.0
     }
 
-    /// Encuentra el "Muro Maestro" para el Take Profit Inteligente (Fase 2).
+    /// Busca muros institucionales significativos en el libro de órdenes.
     pub fn find_major_wall(&self, side: char, avg_vol: f64) -> Option<(f64, f64)> {
         let iter: Box<dyn Iterator<Item = (&i64, &f64)>> = if side == '0' {
             Box::new(self.bids.iter().rev())
@@ -125,50 +96,21 @@ impl OrderBook {
             Box::new(self.asks.iter())
         };
 
-        for (price, vol) in iter.take(30) {
-            if *vol > avg_vol * 3.0 {
+        // Escaneamos los niveles más cercanos al precio actual
+        for (price, vol) in iter.take(20) {
+            // Un muro se considera mayor si es al menos 4 veces el promedio de volumen del libro
+            if *vol > avg_vol * 4.0 {
                 return Some((*price as f64 / 100000.0, *vol));
             }
         }
         None
     }
 
-    /// Imbalance del primer nivel (L1)
-    pub fn get_imbalance(&self) -> f64 {
-        let b_vol = self.bids.values().rev().next().unwrap_or(&0.0);
-        let a_vol = self.asks.values().next().unwrap_or(&0.0);
-        if b_vol + a_vol == 0.0 {
-            return 0.0;
-        }
-        (b_vol - a_vol) / (b_vol + a_vol)
-    }
-
-    /// Métrica de Masa Total (Peso del Libro)
+    /// Calcula la profundidad total o intensidad del libro (útil como feature para el BayesianBrain)
     pub fn get_book_intensity(&self) -> f64 {
         self.bids.values().sum::<f64>() + self.asks.values().sum::<f64>()
     }
-
-    /// Genera un vector de imbalance ponderado para el Cerebro (Fase 4).
-    pub fn get_depth_vector(&self, levels: usize) -> Vec<f64> {
-        let mut depth_v = Vec::with_capacity(levels);
-        let mut bid_iter = self.bids.values().rev();
-        let mut ask_iter = self.asks.values();
-
-        for i in 0..levels {
-            let b_vol = bid_iter.next().unwrap_or(&0.0);
-            let a_vol = ask_iter.next().unwrap_or(&0.0);
-
-            // Ponderación cuadrática inversa para dar más peso a niveles cercanos
-            let weight = 1.0 / (i + 1) as f64;
-
-            let imb = if b_vol + a_vol == 0.0 {
-                0.0
-            } else {
-                ((b_vol - a_vol) / (b_vol + a_vol)) * weight
-            };
-            depth_v.push(imb);
-        }
-        depth_v
-    }
 }
+
+
 

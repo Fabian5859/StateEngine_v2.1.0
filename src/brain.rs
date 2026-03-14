@@ -27,12 +27,11 @@ pub struct BayesianBrain {
 impl BayesianBrain {
     pub fn new(input_dim: usize, hidden_dim: usize, lr: f64) -> Self {
         Self {
-            // Inicialización Xavier/Glorot implícita con Normal(0, 0.1)
             weights1: Array2::random((input_dim, hidden_dim), Normal::new(0.0, 0.1).unwrap()),
             weights2: Array1::random(hidden_dim, Normal::new(0.0, 0.1).unwrap()),
             variance1: Array2::from_elem((input_dim, hidden_dim), 0.02),
             variance2: Array1::from_elem(hidden_dim, 0.02),
-            learning_rate: lr, // Fase 4: 0.005
+            learning_rate: lr,
         }
     }
 
@@ -58,8 +57,10 @@ impl BayesianBrain {
         s * (1.0 - s)
     }
 
-    /// Inferencia por Monte Carlo (MC Dropout funcional)
-    pub fn predict_bayesian(&self, inputs: &Array1<f64>, samples: usize) -> BayesianOutput {
+    /// Inferencia por Monte Carlo (Acepta Vec<f64> para facilitar integración con main)
+    pub fn predict_bayesian(&self, inputs_vec: &Vec<f64>, samples: usize) -> BayesianOutput {
+        let inputs = Array1::from(inputs_vec.clone());
+
         if inputs.len() != self.weights1.nrows() {
             return BayesianOutput {
                 mu: 0.5,
@@ -72,7 +73,6 @@ impl BayesianBrain {
         let mut predictions = Vec::with_capacity(samples);
 
         for _ in 0..samples {
-            // Muestreo de pesos para capturar incertidumbre epistémica
             let sampled_w2 = Array1::from_shape_fn(self.weights2.len(), |i| {
                 let dist =
                     Normal::new(self.weights2[i], self.variance2[i].sqrt().max(1e-6)).unwrap();
@@ -89,7 +89,7 @@ impl BayesianBrain {
         let var_e: f64 = predictions.iter().map(|p| (p - mu).powi(2)).sum::<f64>() / samples as f64;
         let sigma_e = var_e.sqrt();
 
-        // SNR: Cuánta señal (distancia de 0.5) tenemos frente a la incertidumbre (sigma)
+        // SNR: Señal vs Incertidumbre
         let snr = (mu - 0.5).abs() / sigma_e.max(1e-6);
 
         BayesianOutput {
@@ -99,7 +99,10 @@ impl BayesianBrain {
         }
     }
 
-    pub fn train(&mut self, inputs: &Array1<f64>, target: f64) {
+    /// Entrenamiento (Acepta Vec<f64> para procesar las 'entry_features' del Paso C)
+    pub fn train(&mut self, inputs_vec: &Vec<f64>, target: f64) {
+        let inputs = Array1::from(inputs_vec.clone());
+
         if inputs.len() != self.weights1.nrows() {
             return;
         }
@@ -111,12 +114,11 @@ impl BayesianBrain {
 
         let error = prediction - target;
 
-        // Retropropagación y ajuste de confianza (Varianza)
+        // Backpropagation con ajuste de varianza bayesiana
         let d_z2 = error * self.sigmoid_derivative(z2);
         for i in 0..self.weights2.len() {
             let grad = d_z2 * a1[i];
             self.weights2[i] -= self.learning_rate * grad;
-            // Estabilización: Si el error baja, la varianza (incertidumbre) cae
             self.variance2[i] *= 0.995 + (error.abs() * 0.005);
         }
 

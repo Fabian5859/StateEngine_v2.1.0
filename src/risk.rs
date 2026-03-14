@@ -1,21 +1,22 @@
 use crate::state::{Position, TradeStatus};
 use chrono::Local;
+use std::collections::HashMap;
 
 pub struct RiskManager {
-    pub max_concurrent_trades: usize,
+    pub max_per_side: usize,
     pub status: TradeStatus,
-    pub hard_stop_pips: f64,      // El "paracaídas" físico (ej. 25 pips)
-    pub daily_loss_limit: f64,    // Máxima pérdida diaria permitida
+    pub hard_stop_pips: f64,
+    pub daily_loss_limit: f64,
     pub current_daily_loss: f64,
 }
 
 impl RiskManager {
-    pub fn new(max_ops: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            max_concurrent_trades: max_ops,
+            max_per_side: 3,
             status: TradeStatus::Idle,
-            hard_stop_pips: 25.0,
-            daily_loss_limit: 500.0, // Ejemplo: $500
+            hard_stop_pips: 30.0,
+            daily_loss_limit: 1000.0,
             current_daily_loss: 0.0,
         }
     }
@@ -24,56 +25,41 @@ impl RiskManager {
         &self,
         side: char,
         probability: f64,
-        active_positions: &Vec<Position>,
+        active_positions: &HashMap<String, Position>,
     ) -> bool {
-        // Bloqueo si excedimos pérdida diaria
         if self.current_daily_loss >= self.daily_loss_limit {
             return false;
         }
-
-        // Regla de Probabilidad (80%)
-        if probability < 0.80 {
+        if probability < 0.85 {
             return false;
         }
 
-        // Solo SELL para Carry Trade (según tu requerimiento anterior)
-        if side != '2' {
+        // Restricción 1: Máximo 3 totales por lado (Buy o Sell)
+        let count_side = active_positions.values().filter(|p| p.side == side).count();
+        if count_side >= self.max_per_side {
             return false;
         }
 
-        // Límite de simultáneas
-        if active_positions.len() >= self.max_concurrent_trades {
-            return false;
-        }
-
-        // Validación Diaria
+        // Restricción 2: Máximo 1 abierta del día en curso (que no esté olvidada)
         let today = Local::now().date_naive();
-        let already_traded_today = active_positions
-            .iter()
-            .any(|pos| pos.opened_at.date_naive() == today);
+        let has_active_today = active_positions
+            .values()
+            .any(|p| p.side == side && p.opened_at.date_naive() == today && !p.is_forgotten);
 
-        if already_traded_today {
+        if has_active_today {
             return false;
         }
 
         true
     }
 
-    /// Calcula el precio del Hard-Stop para enviarlo en el mensaje FIX
     pub fn calculate_hard_stop(&self, side: char, entry_price: f64) -> f64 {
         let offset = self.hard_stop_pips / 10000.0;
-        if side == '1' { // Buy
+        if side == '1' {
             entry_price - offset
-        } else { // Sell
+        } else {
             entry_price + offset
         }
     }
-
-    pub fn set_status(&mut self, status: TradeStatus) {
-        self.status = status;
-    }
-
-    pub fn get_status(&self) -> TradeStatus {
-        self.status
-    }
 }
+
