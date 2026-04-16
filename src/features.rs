@@ -5,7 +5,7 @@ pub struct FeatureCollector {
     pub window_size: usize,
     pub snr_history: VecDeque<f64>,
     pub snr_ema: f64,
-    // Se elimina tape_volume_acc al no contar con el feed de trades
+    pub tape_volume_acc: f64, // Reintegrado para capturar el feed de trades
 }
 
 impl FeatureCollector {
@@ -14,7 +14,13 @@ impl FeatureCollector {
             window_size,
             snr_history: VecDeque::with_capacity(window_size),
             snr_ema: 0.0,
+            tape_volume_acc: 0.0,
         }
+    }
+
+    /// Acumula el volumen de los trades ejecutados (Tag 269=2)
+    pub fn add_tape_trade(&mut self, volume: f64) {
+        self.tape_volume_acc += volume;
     }
 
     /// Agrega el valor de SNR actual y actualiza el promedio móvil (EMA)
@@ -40,10 +46,10 @@ impl FeatureCollector {
         current_snr / self.snr_ema
     }
 
-    /// Genera el vector de entrada para el BayesianBrain basado solo en LOB y Velocidad
-    /// El vector resultante debe mantener la dimensión esperada por el modelo (ej. 10D)
+    /// Genera el vector de entrada para el BayesianBrain.
+    /// Ahora incluye el Tape Volume (Dipta Das logic).
     pub fn push_features(
-        &self,
+        &mut self, // Cambiado a mut para poder resetear el tape_volume_acc
         book: &OrderBook,
         velocity: f64,
         spread: f64,
@@ -51,16 +57,16 @@ impl FeatureCollector {
     ) -> Vec<f64> {
         let mut f = Vec::with_capacity(10);
 
-        // 1. Intensidad total del libro
+        // 1. Intensidad total del libro (Liquidez total)
         f.push(book.get_book_intensity());
 
-        // 2. Desequilibrio del libro (Imbalance)
+        // 2. Desequilibrio del libro (Imbalance de intención)
         let total_bids: f64 = book.bids.values().sum();
         let total_asks: f64 = book.asks.values().sum();
         let imbalance = (total_bids - total_asks) / (total_bids + total_asks + 1.0);
         f.push(imbalance);
 
-        // 3. Velocidad de ejecución (Ticks por segundo)
+        // 3. Velocidad de actualización (Market Activity)
         f.push(velocity);
 
         // 4. Spread actual normalizado
@@ -69,30 +75,30 @@ impl FeatureCollector {
         // 5. SNR anterior (Feedback del modelo)
         f.push(last_snr);
 
-        // 6. Densidad en el Best Bid
+        // 6. VOLUMEN REAL EJECUTADO (Tape Reading - Dipta Das)
+        // Usamos el acumulado desde el último tick y lo reseteamos
+        f.push(self.tape_volume_acc);
+        self.tape_volume_acc = 0.0;
+
+        // 7. Densidad en el Best Bid
         f.push(*book.bids.values().rev().next().unwrap_or(&0.0));
 
-        // 7. Densidad en el Best Ask
+        // 8. Densidad en el Best Ask
         f.push(*book.asks.values().next().unwrap_or(&0.0));
 
-        // 8. Pendiente del libro (Bid) - Comparación niveles cercanos vs profundos
+        // 9. Presión de compra cercana (Top 5 Bids)
         let near_bid: f64 = book.bids.values().rev().take(5).sum();
         f.push(near_bid);
 
-        // 9. Pendiente del libro (Ask)
+        // 10. Presión de venta cercana (Top 5 Asks)
         let near_ask: f64 = book.asks.values().take(5).sum();
         f.push(near_ask);
-
-        // 10. Volatilidad de corto plazo (puedes usar un placeholder o la velocidad corregida)
-        f.push(velocity.abs().sqrt());
 
         f
     }
 
     /// Estandariza el vector de entrada (Z-Score simplificado o escalado)
     pub fn get_standardized_vector(&self, raw_features: Vec<f64>) -> Vec<f64> {
-        // En una implementación real, aquí restarías la media y dividirías por la desviación
-        // Por ahora, aplicamos un escalado logarítmico para normalizar magnitudes grandes (como el volumen)
         raw_features
             .into_iter()
             .map(|v| {

@@ -16,7 +16,6 @@ impl Executor {
     }
 
     /// PASO B: Estrategia Test de Absorción (Basada 100% en LOB)
-    /// Detecta la resistencia del mercado cuando el precio choca contra un muro institucional.
     pub fn evaluate_absorption_test(
         &mut self,
         side: char,
@@ -24,18 +23,15 @@ impl Executor {
         avg_vol: f64,
         current_mid: f64,
     ) -> Option<f64> {
-        // 1. Detección de Hueco de Liquidez
         if !book.is_liquidity_gap(side, 5) {
             return None;
         }
 
-        // 2. Identificar el muro institucional en el lado opuesto
         let wall_side_to_look = if side == '1' { '0' } else { '1' };
 
         if let Some((wall_price, wall_vol)) = book.find_major_wall(wall_side_to_look, avg_vol) {
             let distance = (wall_price - current_mid).abs() * 10000.0;
 
-            // 3. Test de Absorción: El precio llega al muro y este resiste
             if distance <= 1.2 {
                 if self.last_wall_volume > 0.0
                     && wall_vol < self.last_wall_volume
@@ -56,7 +52,7 @@ impl Executor {
         None
     }
 
-    /// Monitoreo de posiciones para gestión de Salidas (Función Estática para evitar E0502)
+    /// Monitoreo de posiciones: FILTRO ESTRICTO DE CERO CIERRES EN PÉRDIDA
     pub fn monitor_position(
         pos: &Position,
         current_mid: f64,
@@ -69,31 +65,32 @@ impl Executor {
             (pos.entry_price - current_mid) * 10000.0
         };
 
-        // Stop Loss duro de seguridad
-        if pips <= -25.0 {
-            warn!("🚨 [SL] ID: {} alcanzó límite de riesgo.", pos.cl_ord_id);
-            return true;
-        }
+        // --- AJUSTE: ELIMINACIÓN DE STOP LOSS FÍSICO / CIERRE EN PÉRDIDA ---
+        // Se elimina la condición de pips <= -25.0 para cumplir con la política de no cerrar en negativo.
 
-        // Salida por agotamiento de probabilidad (SNR)
-        if pips > 1.5 && current_snr < (snr_avg * 0.6) {
-            info!(
-                "📉 [SALIDA SNR] Probabilidad agotada ({:.2}). Asegurando {:.1} pips",
-                current_snr, pips
-            );
-            return true;
-        }
+        // Solo evaluamos salidas si estamos en territorio positivo (pips > 0)
+        if pips > 0.0 {
+            // 1. Salida por agotamiento de probabilidad (SNR) en Profit
+            // Ajustado a 0.5 del promedio para ser más sensible al "olvido" de la tesis
+            if pips > 1.0 && current_snr < (snr_avg * 0.5) {
+                info!(
+                    "📉 [SALIDA PROFIT] SNR debilitado ({:.2}). Cerrando con {:.1} pips",
+                    current_snr, pips
+                );
+                return true;
+            }
 
-        // Take Profit Dinámico
-        if pips >= 12.0 && current_snr > 0.88 {
-            info!("💰 [TP] Objetivo capturado: {:.1} pips", pips);
-            return true;
+            // 2. Take Profit Dinámico / Objetivo Fijo
+            if pips >= 12.0 && current_snr > 0.88 {
+                info!("💰 [TP] Objetivo capturado: {:.1} pips", pips);
+                return true;
+            }
         }
 
         false
     }
 
-    /// PASO A.4: Gestión de Recovery (Función Estática para evitar E0502)
+    /// PASO A.4: Gestión de Recovery
     pub fn check_forgotten_recovery(
         pos: &Position,
         current_mid: f64,
@@ -110,13 +107,16 @@ impl Executor {
             (pos.entry_price - current_mid) * 10000.0
         };
 
+        // Costo operativo: Comisión + Swap (solo si es negativo para la cuenta)
         let cost_to_cover = commission_pips
             + if swap_pips < 0.0 {
                 swap_pips.abs()
             } else {
                 0.0
             };
-        let target = 26.0 + cost_to_cover;
+
+        // Objetivo: 26 puntos (2.6 pips) netos después de costos
+        let target = 2.6 + cost_to_cover;
 
         pips >= target
     }

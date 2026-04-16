@@ -1,2 +1,4 @@
 /target
 .env
+state_engine_brain.bin
+*.log
