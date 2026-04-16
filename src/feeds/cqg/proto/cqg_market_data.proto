@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package cqg;
+
+// --- MENSAJES DE SALIDA (CLIENTE -> SERVIDOR) ---
+
+message ClientMsg {
+    oneof msg_type {
+        Logon logon = 1;
+        MarketDataSubscription subscription = 2;
+    }
+}
+
+message Logon {
+    string user_name = 1;
+    string password = 2;
+    string application_id = 3;
+    string client_version = 4;
+}
+
+message MarketDataSubscription {
+    uint32 request_id = 1;
+    string symbol = 2;
+    bool subscribe = 3;
+}
+
+// --- MENSAJES DE ENTRADA (SERVIDOR -> CLIENTE) ---
+
+message ServerMsg {
+    oneof msg_type {
+        LogonResult logon_result = 1;
+        RealTimeMarketData market_data = 2;
+    }
+}
+
+message LogonResult {
+    uint32 result_code = 1; // 0 significa éxito
+    string error_description = 2;
+}
+
+message RealTimeMarketData {
+    string symbol = 1;
+    repeated Trade trades = 2;
+    repeated Quote quotes = 3;
+}
+
+message Trade {
+    double price = 1;
+    uint32 volume = 2;
+    uint32 side = 3; // 1=Buy(Ask), 2=Sell(Bid)
+}
+
+message Quote {
+    double bid_price = 1;
+    uint32 bid_volume = 2;
+    double ask_price = 3;
+    uint32 ask_volume = 4;
+}

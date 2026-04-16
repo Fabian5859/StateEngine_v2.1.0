@@ -10,17 +10,19 @@ use tokio::time::{interval, Duration};
 
 use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming, WriteMode};
 
+// --- MÓDULOS DEL MOTOR ---
 mod bayesian;
 mod brain;
 mod executor;
 mod features;
+mod feeds;
 mod fix_engine;
 mod gaussian;
 mod id_gen;
 mod math_utils;
 mod network;
 mod risk;
-mod state;
+mod state; // Nuevo módulo para feeds externos (CQG, etc.)
 
 use brain::BayesianBrain;
 use executor::Executor;
@@ -33,6 +35,7 @@ use state::{OrderBook, Position};
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
 
+    // --- CONFIGURACIÓN DE LOGGER ---
     let _logger = Logger::try_with_str("info")?
         .log_to_file(
             FileSpec::default()
@@ -50,6 +53,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("=== STATE ENGINE: SNIPER LOB-ONLY (V5.2 HIGH-PERFORMANCE) ===");
 
+    // --- PARÁMETROS Y ESTADO ---
     let weights_path = "state_engine_brain.bin";
     let trade_qty = env::var("TRADE_QTY")
         .unwrap_or_else(|_| "1000".to_string())
@@ -74,6 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut pending_thesis: Option<Position> = None;
     let mut prediction_queue: VecDeque<(Vec<f64>, f64)> = VecDeque::new();
 
+    // --- CONFIGURACIÓN FIX (IC MARKETS) ---
     let host = env::var("FIX_HOST")?;
     let sender_id = env::var("FIX_SENDER_ID")?;
     let target_id = env::var("FIX_TARGET_ID")?;
@@ -81,6 +86,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let port_quote = env::var("FIX_PORT_QUOTE")?;
     let port_trade = env::var("FIX_PORT_TRADE")?;
     let symbol = env::var("FIX_SYMBOL").unwrap_or_else(|_| "EURUSD".to_string());
+
+    // --- LANZAMIENTO DE FEEDS EXTERNOS (CQG) ---
+    // Usamos spawn para que corra en su propio hilo asíncrono
+    tokio::spawn(async move {
+        // ID de tu demo de CQG activa
+        feeds::cqg::connect_to_cqg("PSCQCDemo10544").await;
+    });
 
     'reconnect: loop {
         info!("🔌 Conectando a cTrader FIX Gateway...");
@@ -103,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        // Logon Inicial
+        // Logon Inicial FIX
         let mut buf_q = Vec::new();
         engine.build_logon(
             &mut buf_q, &sender_id, &target_id, "QUOTE", &password, quote_seq,
@@ -123,13 +135,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let mut hb_timer_q = interval(Duration::from_secs(25));
         let mut hb_timer_t = interval(Duration::from_secs(25));
-        let mut quote_buf = [0u8; 32768]; // Buffer más grande para ráfagas LOB
+        let mut quote_buf = [0u8; 32768];
         let mut trade_buf = [0u8; 16384];
 
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    info!("🛑 Guardando Cerebro...");
+                    info!("🛑 Guardando Cerebro y Apagando...");
                     let _ = brain.save_to_file(weights_path);
                     return Ok(());
                 }
@@ -157,34 +169,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if n == 0 { break; }
                         let raw = String::from_utf8_lossy(&quote_buf[..n]);
 
-                        // --- LÓGICA DE ESCANEO DE MENSAJES FIX ---
                         let mut search_pos = 0;
                         while let Some(start) = raw[search_pos..].find("8=FIX.4.4") {
                             let msg_start = search_pos + start;
                             let rest = &raw[msg_start..];
 
-                            // Buscamos el final del mensaje mediante el Checksum (Tag 10)
                             if let Some(chk_pos) = rest.find("\x0110=") {
                                 let after_chk = &rest[chk_pos + 4..];
                                 if let Some(final_sep) = after_chk.find('\x01') {
                                     let msg_len = chk_pos + 4 + final_sep + 1;
                                     let full_msg = &rest[..msg_len];
 
-                                    // Procesamos solo mensajes de cotización
                                     process_lob_message(full_msg, &mut order_book, &mut tick_count, &mut collector);
-
                                     search_pos = msg_start + msg_len;
                                 } else { break; }
                             } else { break; }
                         }
 
-                        // Cálculos y Feature Engineering
+                        // --- FEATURE ENGINEERING Y PREDICCIÓN ---
                         if let Some(mid) = order_book.get_mid_price() {
                             let elapsed = last_velocity_calc.elapsed().as_secs_f64();
                             if elapsed >= 1.0 {
                                 current_velocity = tick_count / elapsed;
                                 info!("📊 [HEALTH] Mid: {:.5} | Ticks/s: {:.0} | Tape Vol: {:.0} | B:{} A:{}",
-                                      mid, current_velocity, collector.tape_volume_acc, order_book.bids.len(), order_book.asks.len());
+                                     mid, current_velocity, collector.tape_volume_acc, order_book.bids.len(), order_book.asks.len());
                                 tick_count = 0.0;
                                 last_velocity_calc = Instant::now();
                             }
@@ -196,7 +204,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let b_out = brain.predict_bayesian(&norm_v, 20);
                                 collector.push_snr(b_out.snr);
 
-                                // Entrenamiento y gestión de trades
+                                // Gestión de posiciones existentes
                                 let mut to_close = Vec::new();
                                 for (id, pos) in executor.positions.iter_mut() {
                                     let pips = if pos.side == '1' { (mid - pos.entry_price) * 10000.0 } else { (pos.entry_price - mid) * 10000.0 };
@@ -209,6 +217,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         if pips > 0.0 { brain.train(&pos.entry_features, 1.0); }
                                     }
                                 }
+
                                 for id in to_close {
                                     if let Some(pos) = executor.positions.remove(&id) {
                                         trade_seq += 1;
@@ -219,7 +228,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                // Detección de Absorción Sniper
+                                // --- DETECCIÓN DE ABSORCIÓN SNIPER ---
                                 for side in ['1', '2'] {
                                     if risk_manager.validate_signal(side, b_out.snr, &executor.positions) {
                                         if let Some(limit_price) = executor.evaluate_absorption_test(side, &order_book, 60.0, mid) {
@@ -256,6 +265,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
+
+// --- UTILIDADES DE PROCESAMIENTO FIX ---
 
 fn process_lob_message(
     msg: &str,
@@ -314,4 +325,3 @@ fn extract_tag_string(msg: &str, tag: &str) -> Option<String> {
         frag[..end].to_string()
     })
 }
-
