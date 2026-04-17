@@ -1,135 +1,115 @@
-use ndarray::{Array1, Array2};
-use ndarray_rand::RandomExt;
-use rand::prelude::*;
-use rand_distr::Normal;
-use serde::{Deserialize, Serialize};
-use std::f64::consts::E;
+use log::{error, info};
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
 
-#[derive(Debug)]
-pub struct BayesianOutput {
-    pub mu: f64,
-    pub sigma_epistemic: f64,
-    pub snr: f64,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct BayesianBrain {
-    weights1: Array2<f64>,
-    weights2: Array1<f64>,
-    variance1: Array2<f64>,
-    variance2: Array1<f64>,
-    learning_rate: f64,
+    pub weights: Vec<f64>,
+    pub learning_rate: f64,
+    pub belief_threshold: f64,
+    pub history: VecDeque<f64>,
 }
 
 impl BayesianBrain {
-    pub fn new(input_dim: usize, hidden_dim: usize, lr: f64) -> Self {
+    pub fn new(input_size: usize) -> Self {
         Self {
-            weights1: Array2::random((input_dim, hidden_dim), Normal::new(0.0, 0.1).unwrap()),
-            weights2: Array1::random(hidden_dim, Normal::new(0.0, 0.1).unwrap()),
-            variance1: Array2::from_elem((input_dim, hidden_dim), 0.02),
-            variance2: Array1::from_elem(hidden_dim, 0.02),
-            learning_rate: lr,
+            weights: vec![0.0; input_size],
+            learning_rate: 0.005,
+            belief_threshold: 0.65,
+            history: VecDeque::with_capacity(100),
         }
     }
 
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
-        let file = File::create(path)?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, &self)?;
+    pub fn load_from_file(path: &str, input_size: usize) -> Self {
+        let mut weights = vec![0.0; input_size];
+        if let Ok(file) = File::open(path) {
+            let reader = BufReader::new(file);
+            for (i, line) in reader.lines().enumerate() {
+                if i < input_size {
+                    if let Ok(val) = line.unwrap().parse::<f64>() {
+                        weights[i] = val;
+                    }
+                }
+            }
+            info!("📖 Pesos cargados desde memoria: {:?}", weights);
+        } else {
+            info!("🆕 No se encontró memoria previa. Iniciando pesos en 0.0");
+        }
+
+        Self {
+            weights,
+            learning_rate: 0.005,
+            belief_threshold: 0.65,
+            history: VecDeque::with_capacity(100),
+        }
+    }
+
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        for w in &self.weights {
+            writeln!(file, "{}", w)?;
+        }
         Ok(())
     }
 
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        Ok(bincode::deserialize_from(reader)?)
+    pub fn predict(&self, features: &[f64]) -> f64 {
+        let score: f64 = features
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(f, w)| f * w)
+            .sum();
+        score.tanh()
     }
 
-    fn sigmoid(&self, x: f64) -> f64 {
-        1.0 / (1.0 + E.powf(-x))
-    }
-
-    fn sigmoid_derivative(&self, x: f64) -> f64 {
-        let s = self.sigmoid(x);
-        s * (1.0 - s)
-    }
-
-    /// Inferencia por Monte Carlo (Acepta Vec<f64> para facilitar integración con main)
-    pub fn predict_bayesian(&self, inputs_vec: &Vec<f64>, samples: usize) -> BayesianOutput {
-        let inputs = Array1::from(inputs_vec.clone());
-
-        if inputs.len() != self.weights1.nrows() {
-            return BayesianOutput {
-                mu: 0.5,
-                sigma_epistemic: 1.0,
-                snr: 0.0,
-            };
-        }
-
-        let mut rng = thread_rng();
-        let mut predictions = Vec::with_capacity(samples);
-
-        for _ in 0..samples {
-            let sampled_w2 = Array1::from_shape_fn(self.weights2.len(), |i| {
-                let dist =
-                    Normal::new(self.weights2[i], self.variance2[i].sqrt().max(1e-6)).unwrap();
-                dist.sample(&mut rng)
-            });
-
-            let z1 = inputs.dot(&self.weights1);
-            let a1 = z1.mapv(|x| self.sigmoid(x));
-            let z2 = a1.dot(&sampled_w2);
-            predictions.push(self.sigmoid(z2));
-        }
-
-        let mu: f64 = predictions.iter().sum::<f64>() / samples as f64;
-        let var_e: f64 = predictions.iter().map(|p| (p - mu).powi(2)).sum::<f64>() / samples as f64;
-        let sigma_e = var_e.sqrt();
-
-        // SNR: Señal vs Incertidumbre
-        let snr = (mu - 0.5).abs() / sigma_e.max(1e-6);
-
-        BayesianOutput {
-            mu,
-            sigma_epistemic: sigma_e,
-            snr,
+    pub fn should_trade(&self, prediction: f64) -> (bool, char) {
+        if prediction > self.belief_threshold {
+            (true, '1')
+        } else if prediction < -self.belief_threshold {
+            (true, '2')
+        } else {
+            (false, '0')
         }
     }
 
-    /// Entrenamiento (Acepta Vec<f64> para procesar las 'entry_features' del Paso C)
-    pub fn train(&mut self, inputs_vec: &Vec<f64>, target: f64) {
-        let inputs = Array1::from(inputs_vec.clone());
+    pub fn train_with_reward(&mut self, features: &[f64], points: f64, was_forgotten: bool) {
+        let reward = if was_forgotten {
+            -1.0
+        } else if points >= 20.0 {
+            1.2
+        } else if points >= 15.0 {
+            1.0
+        } else if points >= 7.0 {
+            0.2
+        } else {
+            0.0
+        };
 
-        if inputs.len() != self.weights1.nrows() {
-            return;
+        let prediction = self.predict(features);
+        let error_val = reward - prediction;
+
+        for (i, f) in features.iter().enumerate() {
+            self.weights[i] += self.learning_rate * error_val * f;
         }
+        info!(
+            "🧠 Entrenamiento completado. Recompensa: {:.1} | Error: {:.4}",
+            reward, error_val
+        );
+    }
 
-        let z1 = inputs.dot(&self.weights1);
-        let a1 = z1.mapv(|x| self.sigmoid(x));
-        let z2 = a1.dot(&self.weights2);
-        let prediction = self.sigmoid(z2);
-
-        let error = prediction - target;
-
-        // Backpropagation con ajuste de varianza bayesiana
-        let d_z2 = error * self.sigmoid_derivative(z2);
-        for i in 0..self.weights2.len() {
-            let grad = d_z2 * a1[i];
-            self.weights2[i] -= self.learning_rate * grad;
-            self.variance2[i] *= 0.995 + (error.abs() * 0.005);
+    pub fn audit_weights(&self) {
+        let labels = [
+            "OFI",
+            "MicroPriceDiv",
+            "Spread",
+            "BidSlope",
+            "AskSlope",
+            "Phase",
+        ];
+        let mut audit_msg = String::from("📊 ESTADO DEL MODELO: ");
+        for (i, w) in self.weights.iter().enumerate() {
+            audit_msg.push_str(&format!("{}: {:.4} | ", labels[i], w));
         }
-
-        let d_a1 = d_z2 * &self.weights2;
-        for i in 0..self.weights1.nrows() {
-            for j in 0..self.weights1.ncols() {
-                let grad = d_a1[j] * self.sigmoid_derivative(z1[j]) * inputs[i];
-                self.weights1[[i, j]] -= self.learning_rate * grad;
-                self.variance1[[i, j]] *= 0.995 + (error.abs() * 0.005);
-            }
-        }
+        info!("{}", audit_msg);
     }
 }
 
