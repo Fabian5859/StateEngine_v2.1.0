@@ -9,7 +9,7 @@ pub struct FixEngine {
 
 impl FixEngine {
     pub fn new() -> Self {
-        info!("Inicializando Motor FEFIX v0.7.0 - Institutional Sniper Safety Config");
+        info!("🎯 Motor FIX sincronizado con Parámetros Institucionales (LD5)");
         Self {
             encoder: Encoder::<Config>::default(),
         }
@@ -34,15 +34,14 @@ impl FixEngine {
         msg.set_any(TagU16::new(56).unwrap(), target_id.as_bytes());
         msg.set_any(TagU16::new(50).unwrap(), sender_sub_id.as_bytes());
         msg.set_any(TagU16::new(57).unwrap(), sender_sub_id.as_bytes());
-
         msg.set_any(TagU16::new(34).unwrap(), format!("{}", seq_num).as_bytes());
         msg.set_any(TagU16::new(52).unwrap(), now.as_bytes());
 
-        msg.set_any(TagU16::new(98).unwrap(), b"0");
-        msg.set_any(TagU16::new(108).unwrap(), b"30");
+        msg.set_any(TagU16::new(98).unwrap(), b"0"); // Encryption: None
+        msg.set_any(TagU16::new(108).unwrap(), b"30"); // HeartBtInt: 30s
         msg.set_any(TagU16::new(553).unwrap(), account_number.as_bytes());
         msg.set_any(TagU16::new(554).unwrap(), password.as_bytes());
-        msg.set_any(TagU16::new(141).unwrap(), b"Y"); // Reset Sequence para evitar bloqueos
+        msg.set_any(TagU16::new(141).unwrap(), b"Y"); // ResetSeqNum: Siempre 'Y' para evitar desincronía en Real
 
         msg.wrap();
     }
@@ -91,16 +90,16 @@ impl FixEngine {
 
         msg.set_any(TagU16::new(262).unwrap(), b"REQ_DEEP_LOB");
         msg.set_any(TagU16::new(263).unwrap(), b"1"); // Snapshot + Updates
-        msg.set_any(TagU16::new(264).unwrap(), b"0"); // Full Depth
-        msg.set_any(TagU16::new(265).unwrap(), b"1"); // Incremental
+        msg.set_any(TagU16::new(264).unwrap(), b"0"); // Full Depth (Crítico para OFI)
+        msg.set_any(TagU16::new(265).unwrap(), b"1"); // Incremental Refresh
 
-        // Petición explícita de tipos de datos (Bid, Ask, Trade)
+        // Petición explícita de tipos de datos: Bid(0), Ask(1), Trade(2)
         msg.set_any(TagU16::new(267).unwrap(), b"3");
-        msg.set_any(TagU16::new(269).unwrap(), b"0"); // Bid
-        msg.set_any(TagU16::new(269).unwrap(), b"1"); // Ask
-        msg.set_any(TagU16::new(269).unwrap(), b"2"); // Trades (TAPE)
+        msg.set_any(TagU16::new(269).unwrap(), b"0");
+        msg.set_any(TagU16::new(269).unwrap(), b"1");
+        msg.set_any(TagU16::new(269).unwrap(), b"2");
 
-        msg.set_any(TagU16::new(146).unwrap(), b"1");
+        msg.set_any(TagU16::new(146).unwrap(), b"1"); // NoRelatedSym
         msg.set_any(TagU16::new(55).unwrap(), symbol.as_bytes());
 
         msg.wrap();
@@ -137,12 +136,15 @@ impl FixEngine {
             TagU16::new(38).unwrap(),
             format!("{}", qty as u64).as_bytes(),
         );
-        msg.set_any(TagU16::new(40).unwrap(), b"1"); // Market
+        msg.set_any(TagU16::new(40).unwrap(), b"1"); // Market Order
         msg.set_any(TagU16::new(59).unwrap(), b"1"); // GTC
-        msg.set_any(
-            TagU16::new(99).unwrap(),
-            format!("{:.5}", hard_stop_price).as_bytes(),
-        );
+
+        if hard_stop_price > 0.0 {
+            msg.set_any(
+                TagU16::new(99).unwrap(),
+                format!("{:.5}", hard_stop_price).as_bytes(),
+            );
+        }
 
         msg.wrap();
     }

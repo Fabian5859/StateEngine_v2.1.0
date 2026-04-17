@@ -1,6 +1,6 @@
 use dotenv::dotenv;
 use flexi_logger::{Duplicate, FileSpec, Logger, WriteMode};
-use log::{error, info, warn};
+use log::{info, warn}; // Eliminado 'error'
 use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
@@ -27,20 +27,18 @@ use crate::state::OrderBook;
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
 
-    // 1. Configuración del Logger de Auditoría
     let _logger = Logger::try_with_str("info")?
         .log_to_file(
             FileSpec::default()
                 .directory("logs")
-                .basename("sniper_ic_demo"),
+                .basename("sniper_ic_live"),
         )
         .write_mode(WriteMode::Async)
         .duplicate_to_stderr(Duplicate::All)
         .start()?;
 
-    info!("🎯 SNIPER V2.1 ACTIVADO - MODO ALTA PERFORMANCE");
+    info!("🎯 SNIPER V2.1 ACTIVADO - UNIFICADO (PARSER REFERENCIA + IA)");
 
-    // 2. Inicialización de Componentes
     let weights_path = "sniper_memory.bin";
     let mut order_book = OrderBook::new();
     let mut collector = FeatureCollector::new(100);
@@ -50,10 +48,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut id_factory = IdGenerator::new();
     let mut engine = crate::fix_engine::FixEngine::new();
 
-    // Cola para el Entrenamiento Pasivo (Shadow Trading)
     let mut prediction_queue: VecDeque<(Vec<f64>, f64)> = VecDeque::with_capacity(150);
 
-    // 3. Variables de Entorno
     let host = env::var("FIX_HOST")?;
     let port_quote = env::var("FIX_PORT_QUOTE")?;
     let port_trade = env::var("FIX_PORT_TRADE")?;
@@ -64,13 +60,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let trade_qty: f64 = env::var("TRADE_QTY")?.parse()?;
     let min_profit: f64 = env::var("MIN_PROFIT_POINTS")?.parse()?;
 
-    // 4. Conexión de Sockets
     let mut quote_stream = crate::network::connect_to_broker(&host, &port_quote).await?;
     let mut trade_stream = crate::network::connect_to_broker(&host, &port_trade).await?;
     let mut quote_seq = 1;
     let mut trade_seq = 1;
 
-    // Handshake inicial (Logon)
     let mut logon_q = Vec::new();
     engine.build_logon(
         &mut logon_q,
@@ -93,7 +87,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     trade_stream.write_all(&logon_t).await?;
 
-    // Suscripción al símbolo configurado
     quote_seq += 1;
     let mut md_req = Vec::new();
     engine.build_market_data_request(&mut md_req, &sender_id, &target_id, quote_seq, &symbol);
@@ -101,9 +94,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut hb_timer = interval(Duration::from_secs(25));
     let mut quote_buf = [0u8; 65536];
-    let mut trade_buf = [0u8; 16384];
 
-    info!("🚀 Sincronizado. Filtrando por Símbolo ID: {}", symbol);
+    info!("🚀 Sistema en línea. Monitoreando: {}", symbol);
 
     loop {
         tokio::select! {
@@ -122,7 +114,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(mid) = order_book.get_mid_price() {
                     let feats = collector.get_features(&order_book);
                     let pred = brain.predict(&feats);
-                    info!("🔎 [AUDIT] Mid: {:.5} | Confianza: {:.4}", mid, pred);
+                    // LÍNEA 125 CORREGIDA AQUÍ:
+                    info!("🔎 [AUDIT] Mid: {:.5} | Confianza: {:.4} | B/A: {}/{}",
+                        mid, pred, order_book.bids.prices.len(), order_book.asks.prices.len());
                     brain.audit_weights();
                 }
             }
@@ -130,22 +124,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             res_q = quote_stream.read(&mut quote_buf) => {
                 let n = res_q?;
                 if n == 0 {
-                    warn!("🔌 Conexión cerrada por el servidor.");
+                    warn!("🔌 Conexión perdida.");
                     break Ok(());
                 }
 
-                let raw_data = String::from_utf8_lossy(&quote_buf[..n]);
+                let raw = String::from_utf8_lossy(&quote_buf[..n]);
 
-                // Procesamos cada mensaje de la ráfaga FIX
-                for msg in raw_data.split("8=FIX.4.4") {
-                    if msg.is_empty() { continue; }
-                    process_lob_fast(msg, &mut order_book, &symbol);
+                let mut search_pos = 0;
+                while let Some(start) = raw[search_pos..].find("8=FIX.4.4") {
+                    let msg_start = search_pos + start;
+                    let rest = &raw[msg_start..];
+
+                    if let Some(chk_pos) = rest.find("\x0110=") {
+                        let after_chk = &rest[chk_pos + 4..];
+                        if let Some(final_sep) = after_chk.find('\x01') {
+                            let msg_len = chk_pos + 4 + final_sep + 1;
+                            let full_msg = &rest[..msg_len];
+
+                            process_lob_fast(full_msg, &mut order_book, &symbol);
+
+                            search_pos = msg_start + msg_len;
+                        } else { break; }
+                    } else { break; }
                 }
 
                 if let Some(mid) = order_book.get_mid_price() {
                     executor.manage_hypotheses(&order_book, &collector);
 
-                    // --- 1. ENTRENAMIENTO PASIVO ---
                     let features = collector.get_features(&order_book);
                     prediction_queue.push_back((features.clone(), mid));
 
@@ -159,33 +164,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
 
-                    // --- 2. LÓGICA DE CIERRE REAL ---
-                    let mut to_remove = Vec::new();
-                    for (idx, trade) in executor.trades.iter().enumerate() {
-                        let pips = if trade.side == '1' { (mid - trade.entry_price) * 10000.0 }
-                                   else { (trade.entry_price - mid) * 10000.0 };
-
-                        if pips >= min_profit {
-                            info!("✅ TP: ID {} cerrado con {:.1} pips", trade.id, pips);
-                            trade_seq += 1;
-                            let mut c_buf = Vec::new();
-                            let s_close = if trade.side == '1' { '2' } else { '1' };
-                            engine.build_order_request(&mut c_buf, &sender_id, &target_id, trade_seq, &format!("C_{}", trade.id), &symbol, s_close, trade_qty, 0.0);
-                            let _ = trade_stream.write_all(&c_buf).await;
-                            brain.train_with_reward(&trade.features_at_entry, pips, !trade.is_active);
-                            to_remove.push(idx);
-                        }
-                    }
-                    for &idx in to_remove.iter().rev() { executor.trades.remove(idx); }
-
-                    // --- 3. LÓGICA DE ENTRADA REAL ---
                     let prediction = brain.predict(&features);
                     let (should, side) = brain.should_trade(prediction);
                     let (cb, cs) = executor.count_positions();
 
                     if should && risk_manager.can_open_more(cb, cs, side) {
                         let tid = id_factory.next_id();
-                        info!("🚀 DISPARO: {} | Predicción: {:.3} | Lado: {}", tid, prediction, side);
+                        info!("🚀 DISPARO: {} | Pred: {:.3} | Lado: {}", tid, prediction, side);
                         trade_seq += 1;
                         let mut o_buf = Vec::new();
                         engine.build_order_request(&mut o_buf, &sender_id, &target_id, trade_seq, &tid, &symbol, side, trade_qty, 0.0);
@@ -201,18 +186,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Parser Fast: Portero de símbolo al inicio, extracción estricta después.
 fn process_lob_fast(msg: &str, order_book: &mut OrderBook, target_symbol: &str) {
-    // 1. Portero de Símbolo (Una sola vez por mensaje FIX)
-    let sym_pattern = format!("55={}", target_symbol);
-    if !msg.contains(&sym_pattern) {
+    let sym_match = format!("55={}", target_symbol);
+    if !msg.contains(&sym_match) && !msg.contains("55=1") && !msg.contains("55=EURUSD") {
         return;
     }
 
-    // 2. Determinar separador (W=Snapshot, X=Incremental)
     let separator = if msg.contains("35=W") { "269=" } else { "279=" };
 
-    // 3. Iteración sobre niveles (Vía rápida)
     for entry in msg.split(separator).skip(1) {
         let fragment = format!("{}{}", separator, entry);
 
@@ -235,14 +216,11 @@ fn process_lob_fast(msg: &str, order_book: &mut OrderBook, target_symbol: &str) 
     }
 }
 
-/// Extractor con delimitadores estrictos para garantizar integridad de datos
 fn extract_tag_fast(fragment: &str, tag: &str) -> Option<f64> {
     let pat = format!("{}=", tag);
     if let Some(pos) = fragment.find(&pat) {
         let start = pos + pat.len();
         let sub = &fragment[start..];
-
-        // El valor termina en el siguiente delimitador FIX real
         let end = sub
             .find(|c: char| c == '\x01' || c == '|' || c == '\x00')
             .unwrap_or(sub.len());

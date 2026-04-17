@@ -1,4 +1,4 @@
-use log::{error, info};
+use log::info; // Eliminado 'error' que generaba warning
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -63,9 +63,9 @@ impl BayesianBrain {
 
     pub fn should_trade(&self, prediction: f64) -> (bool, char) {
         if prediction > self.belief_threshold {
-            (true, '1')
+            (true, '1') // Buy
         } else if prediction < -self.belief_threshold {
-            (true, '2')
+            (true, '2') // Sell
         } else {
             (false, '0')
         }
@@ -107,7 +107,9 @@ impl BayesianBrain {
         ];
         let mut audit_msg = String::from("📊 ESTADO DEL MODELO: ");
         for (i, w) in self.weights.iter().enumerate() {
-            audit_msg.push_str(&format!("{}: {:.4} | ", labels[i], w));
+            if i < labels.len() {
+                audit_msg.push_str(&format!("{}: {:.4} | ", labels[i], w));
+            }
         }
         info!("{}", audit_msg);
     }
