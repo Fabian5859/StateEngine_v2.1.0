@@ -74,11 +74,18 @@ impl BayesianBrain {
     pub fn train_with_reward(&mut self, features: &[f64], points: f64, was_forgotten: bool) {
         let reward = if was_forgotten {
             -1.0
+        } else if points == 1.0 {
+            //señal de dirección alcista (shadow trading)
+            0.15 //recompensa pequeña para que el peso se mueva sin sobre-ajustar
+        } else if points == -1.0 {
+            //señal de direcciòn bajista (shado trading)
+            -0.15
         } else if points >= 20.0 {
             1.2
         } else if points >= 15.0 {
             1.0
         } else if points >= 7.0 {
+            //comisiones cubiertas
             0.2
         } else {
             0.0
@@ -114,4 +121,3 @@ impl BayesianBrain {
         info!("{}", audit_msg);
     }
 }
-
